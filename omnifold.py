@@ -54,19 +54,6 @@ def prepare_response_data(counts, bin_centers, bin_widths):
         entry_tracker += int(count)
     return MCgen_array, MCreco_array, MCgen_weights, MCreco_weights
 
-def convert_to_TVectorD(array):
-    vector = ROOT.TVectorD(len(array))
-    for i, entry in enumerate(array):
-        vector[i] = entry
-    return vector
-
-def get_vectors(array):
-    vector_list = []
-    for entry in array:
-        vector = convert_to_TVectorD(entry)
-        vector_list.append(vector)
-    return vector_list
-
 def reweight(events, classifier):
     class_probabilities = classifier.predict_proba(events)
     data_probability = class_probabilities[:,1]
@@ -84,10 +71,12 @@ def omnifold(
         MCgen_weights = None,
         MCreco_weights = None,
         measured_weights = None,
-        model_save_dict = None,
-        classifier1_params = None,
-        classifier2_params = None,
-        regressor_params = None
+        classifier1_params = {},
+        classifier2_params = {},
+        regressor_params = {},
+        save_models = False,
+        model_save_name = "bdt_unbinned_omnifold",
+        model_save_path = "./weights/",
     ):
     # Removing events that don't pass generation level cuts
     MCreco_entries = MCreco_entries[MC_pass_truth_mask]
@@ -110,44 +99,21 @@ def omnifold(
     weights_pull = np.ones(len(MCgen_entries))
     weights_push = np.ones(len(MCgen_entries))
 
-    # Converting the TMap strings to the proper types
-    def convert_to_dict(dict):
-        params = {}
-        for key, value in dict.items():
-            if any(char.isdigit() for char in value):
-                number = float(value)
-                if number.is_integer():
-                    number = int(number)
-                params[key] = number
-            elif value == "True" or value == "False":
-                params[key] = bool(value)
-            elif value == "None":
-                params[key] = None
-            else:
-                params[key] = value
-        return params
-    if classifier1_params is not None:
-        classifier1_params = convert_to_dict(classifier1_params)
-    else:
-        classifier1_params = {}
-
-    if classifier2_params is not None:
-        classifier2_params = convert_to_dict(classifier2_params)
-    else:
-        classifier2_params = {}
-
-    if regressor_params is not None:
-        regressor_params = convert_to_dict(regressor_params)
-    else:
-        regressor_params = {}
     step1_classifier = GradientBoostingClassifier(**classifier1_params)
     step2_classifier = GradientBoostingClassifier(**classifier2_params)
     use_regressor =  any(~MC_pass_reco_mask)
     if use_regressor:
         step1_regressor = GradientBoostingRegressor(**regressor_params)
+
+    if save_models:
+        if not os.path.exists(model_save_path):
+            print(f"Path {model_save_path} not found. This path will be created.")
+            os.makedirs(model_save_path, exist_ok=True)
+        else:
+            print(f"Saving models to existing path {model_save_path}")
     
     for i in range(num_iterations):
-        print(f"Starting iteration {i}") 
+        print(f"Starting iteration {i+1} step 1")
         step1_data = np.concatenate((MCreco_entries[MC_pass_reco_mask], measured_entries[measured_pass_reco_mask]))
         step1_labels = np.concatenate((np.zeros(len(MCreco_entries[MC_pass_reco_mask])), measured_labels))
         step1_weights = np.concatenate(
@@ -165,33 +131,31 @@ def omnifold(
             step1_regressor.fit(MCgen_entries[MC_pass_reco_mask], new_weights[MC_pass_reco_mask])
             new_weights[~MC_pass_reco_mask] = step1_regressor.predict(MCgen_entries[~MC_pass_reco_mask])
         weights_pull = np.multiply(weights_push, new_weights)
+
+        if save_models:
+            step1_models = {"step1_classifier": step1_classifier}
+            if use_regressor:
+                step1_models['step1_regressor'] = step1_regressor
+            file = os.path.join(model_save_path, f"{model_save_name}_iter{i+1}_step1.pkl")
+            with open(file, "wb") as outfile:
+                pickle.dump(step1_models, outfile)
             
         # Training step 2 classifier
+        print(f"Starting iteration {i+1} step 2")
         step2_data = np.concatenate((MCgen_entries, MCgen_entries))
         step2_labels = np.concatenate((MC_labels, np.ones(len(MCgen_entries))))
         step2_weights = np.concatenate((np.ones(len(MCgen_entries))*MCgen_weights, weights_pull*MCgen_weights))
         step2_classifier.fit(step2_data, step2_labels, sample_weight = step2_weights)
 
-        # Getting step 2 weights and storing iteration weights
+         # Getting step 2 weights and storing iteration weights
         weights_push = reweight(MCgen_entries, step2_classifier)
-
-    # Saving the models if the user wants to (saved by default)
-    if model_save_dict is not None and model_save_dict['save_models']:
-        base_path = model_save_dict['save_dir']
-        if not os.path.exists(base_path):
-            print(f"Path {base_path} not found. This path will be created.")
-            os.makedirs(base_path, exist_ok=True)
-        else:
-            print(f"Saving models to existing path {base_path}")
-        models = {"step1_classifier": step1_classifier,
-                "step2_classifier": step2_classifier
-                }
-        if use_regressor:
-            models['step1_regressor'] = step1_regressor
-        file = os.path.join(base_path, f"{model_save_dict['model_name']}_models.pkl")
-        with open(file, "wb") as outfile:
-            pickle.dump(models, outfile)
-
+        
+        if save_models:
+            step2_models = {"step2_classifier": step2_classifier}
+            file = os.path.join(model_save_path, f"{model_save_name}_iter{i+1}_step2.pkl")
+            with open(file, "wb") as outfile:
+                pickle.dump(step2_models, outfile)
+        
     return weights_pull, weights_push
 
 
@@ -200,6 +164,7 @@ def binned_omnifold(response_hist, measured_hist, num_iterations, use_density=Fa
     response_counts, response_bin_centers, response_bin_widths = TH2_to_numpy(response_hist)
     MCgen_entries, MCreco_entries, MCgen_weights, MCreco_weights = prepare_response_data(response_counts.flatten(), response_bin_centers.flatten(), response_bin_widths.flatten())
     measured_entries, measured_weights = prepare_hist_data(measured_counts, measured_bin_centers, measured_bin_widths)
+    # use_density option will use the bin widths as weights if it's True
     if not use_density:
         MCgen_weights = np.ones_like(MCgen_weights)
         MCreco_weights = np.ones_like(MCreco_weights)
@@ -239,10 +204,12 @@ def unbinned_omnifold(
         MCgen_weights = None,
         MCreco_weights = None,
         measured_weights = None,
-        model_save_dict = None,
-        classifier1_params=None,
-        classifier2_params=None,
-        regressor_params=None
+        classifier1_params={},
+        classifier2_params={},
+        regressor_params={},
+        save_models=True,
+        model_save_name="bdt_unbinned_omnifold",
+        model_save_path = "./weights/",
     ):
     if MCgen_entries.ndim == 1:
         MCgen_entries = np.expand_dims(MCgen_entries, axis = 1)
@@ -267,33 +234,43 @@ def unbinned_omnifold(
         MCgen_weights,
         MCreco_weights,
         measured_weights,
-        model_save_dict,
         classifier1_params,
         classifier2_params,
-        regressor_params
+        regressor_params,
+        save_models,
+        model_save_name,
+        model_save_path,
     )
 
-def get_step1_predictions(MCgen_data, MCreco_data, model_info_dict, pass_reco = None):
-    file = os.path.join(model_info_dict["save_dir"], f"{model_info_dict['model_name']}_models.pkl")
+def get_step1_predictions(MCgen_data, MCreco_data, model_save_directory = "./weights/", model_name = "bdt_unbinned_omnifold", iteration = 4, pass_reco = None):
+    file = os.path.join(model_save_directory, f"{model_name}_iter{iteration}_step1.pkl")
     if os.path.isfile(file):
         print(f"Opening {file} for step 1 predictions.")
     else:
-        raise ValueError(f"{file} does not exist! Make sure functions SetSaveDirectory and SetModelName are used correctly.")
+        raise ValueError(f"{file} does not exist!")
     with open(file, "rb") as infile:
         loaded_models = pickle.load(infile)
     step1_test_weights = np.ones(len(MCreco_data))
+    if pass_reco is None or len(pass_reco)==0:
+        pass_reco = np.full_like(step1_test_weights, True, dtype=bool)
+    if MCreco_data.ndim == 1:
+        MCreco_data = np.expand_dims(MCreco_data, axis = 1)
+    if MCgen_data.ndim == 1:
+        MCgen_data = np.expand_dims(MCgen_data, axis = 1)
     step1_test_weights[pass_reco] = reweight(MCreco_data[pass_reco], loaded_models['step1_classifier'])
     if any(~pass_reco):
         step1_test_weights[~pass_reco] = loaded_models['step1_regressor'].predict(MCgen_data[~pass_reco])
     return step1_test_weights
 
-def get_step2_predictions(MCgen_data, model_info_dict):
-    file = os.path.join(model_info_dict["save_dir"], f"{model_info_dict['model_name']}_models.pkl")
+def get_step2_predictions(MCgen_data, model_save_directory = "./weights/", model_name = "bdt_unbinned_omnifold", iteration = 4):
+    file = os.path.join(model_save_directory, f"{model_name}_iter{iteration}_step2.pkl")
     if os.path.isfile(file):
         print(f"Opening {file} for step 2 predictions.")
     else:
-        raise ValueError(f"{file} does not exist! Make sure functions SetSaveDirectory and SetModelName are used correctly.")
+        raise ValueError(f"{file} does not exist!")
     with open(file, "rb") as infile:
         loaded_models = pickle.load(infile)
+    if MCgen_data.ndim == 1:
+        MCgen_data = np.expand_dims(MCgen_data, axis = 1)
     step2_test_weights = reweight(MCgen_data, loaded_models['step2_classifier'])
     return step2_test_weights
