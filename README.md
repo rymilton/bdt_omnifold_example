@@ -1,5 +1,5 @@
 # bdt_omnifold_example
-Examples of the boosted decision tree OmniFold for inclusion into RooUnfold.
+Examples of the boosted decision tree OmniFold for inclusion into RooUnfold. The work is primarily based off the paper Ryan Milton, et al, "Tools for unbinned unfolding", JINST 20 P05034 (2025).
 
 ## Environment
 To run the examples in this repository, you need the following packages:
